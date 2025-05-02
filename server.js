@@ -1,298 +1,268 @@
-var express = require('express');
-var bodyParser = require('body-parser');
-var passport = require('passport');
-var authController = require('./auth');
-var authJwtController = require('./auth_jwt');
-var jwt = require('jsonwebtoken');
-var cors = require('cors');
-var User = require('./Users');
-var Movie = require('./Movies');
-var Review = require('./Reviews');
+const express = require('express');
+const bodyParser = require('body-parser');
+const passport = require('passport');
+const authJwtController = require('./auth_jwt'); // You're not using authController, consider removing it
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const User = require('./Users');
+const Movie = require('./Movies'); // You're not using Movie, consider removing it
+const Review = require('./Reviews');
+const mongoose = require('mongoose');
 
-var app = express();
+
+const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
 app.use(passport.initialize());
 
-var router = express.Router();
+const router = express.Router();
 
-router.post('/signup', function(req, res) {
-    if (!req.body.username || !req.body.password) {
-        res.json({success: false, msg: 'Please include both username and password to signup.'})
+// Removed getJSONObjectForMovieRequirement as it's not used
+
+router.post('/signup', async (req, res) => { // Use async/await
+  if (!req.body.username || !req.body.password) {
+    return res.status(400).json({ success: false, msg: 'Please include both username and password to signup.' }); // 400 Bad Request
+  }
+
+  try {
+    const user = new User({ // Create user directly with the data
+      name: req.body.name,
+      username: req.body.username,
+      password: req.body.password,
+    });
+
+    await user.save(); // Use await with user.save()
+
+    res.status(201).json({ success: true, msg: 'Successfully created new user.' }); // 201 Created
+  } catch (err) {
+    if (err.code === 11000) { // Strict equality check (===)
+      return res.status(409).json({ success: false, message: 'A user with that username already exists.' }); // 409 Conflict
     } else {
-        var user = new User();
-        user.name = req.body.name;
-        user.username = req.body.username;
-        user.password = req.body.password;
-
-        user.save(function(err){
-            if (err) {
-                if (err.code == 11000)
-                    return res.json({ success: false, message: 'A user with that username already exists.'});
-                else
-                    return res.json(err);
-            }
-
-            res.json({success: true, msg: 'Successfully created new user.'})
-        });
+      console.error(err); // Log the error for debugging
+      return res.status(500).json({ success: false, message: 'Something went wrong. Please try again later.' }); // 500 Internal Server Error
     }
+  }
 });
 
-router.post('/signin', function (req, res) {
-    var userNew = new User();
-    userNew.username = req.body.username;
-    userNew.password = req.body.password;
 
-    User.findOne({ username: userNew.username }).select('name username password').exec(function(err, user) {
-        if (err) {
-            res.send(err);
-        }
+router.post('/signin', async (req, res) => { // Use async/await
+  try {
+    const user = await User.findOne({ username: req.body.username }).select('name username password');
 
-        user.comparePassword(userNew.password, function(isMatch) {
-            if (isMatch) {
-                var userToken = { id: user.id, username: user.username };
-                var token = jwt.sign(userToken, process.env.SECRET_KEY);
-                res.json ({success: true, token: 'JWT ' + token});
-            }
-            else {
-                res.status(401).send({success: false, msg: 'Authentication failed.'});
-            }
-        })
-    })
+    if (!user) {
+      return res.status(401).json({ success: false, msg: 'Authentication failed. User not found.' }); // 401 Unauthorized
+    }
+
+    const isMatch = await user.comparePassword(req.body.password); // Use await
+
+    if (isMatch) {
+      const userToken = { id: user._id, username: user.username }; // Use user._id (standard Mongoose)
+      const token = jwt.sign(userToken, process.env.SECRET_KEY, { expiresIn: '1h' }); // Add expiry to the token (e.g., 1 hour)
+      res.json({ success: true, token: 'jwt ' + token });
+    } else {
+      res.status(401).json({ success: false, msg: 'Authentication failed. Incorrect password.' }); // 401 Unauthorized
+    }
+  } catch (err) {
+    console.error(err); // Log the error
+    res.status(500).json({ success: false, message: 'Something went wrong. Please try again later.' }); // 500 Internal Server Error
+  }
 });
 
+router.use(authJwtController.isAuthenticated);
+
+// Define endpoints for '/movies'
 router.route('/movies')
-    .post(authJwtController.isAuthenticated, function (req, res) {
-        if(req.body.actors.length < 3){
-            res.status(400).json({message: "Need at least 3 actors"});
-        }else {
-            Movie.find({title: req.body.title}, function (err, data) {
-                if (err) {
-                    res.status(400).json({message: "Invalid query"});
-                } else if (data.length == 0) {
-                    let mov = new Movie({
-                        title: req.body.title,
-                        year_released: req.body.year_released,
-                        genre: req.body.genre,
-                        actors: req.body.actors,
-                        ImageUrl: req.body.ImageUrl
-                    });
-
-                    console.log(req.body);
-
-
-                    mov.save(function (err) {
-                        if (err) {
-                            res.json({message: err});
-                        } else {
-                            res.json({msg: "Successfully saved"});
-                        }
-
-                    });
-                } else {
-                    res.json({message: "Movie already exists"});
-                }
-
-            });
+  // GET all movies
+  .get(authJwtController.isAuthenticated, async (req, res) => {
+    try {
+      if (req.query.reviews === 'true') {
+        const movies = await Movie.aggregate([
+          {
+            $lookup: {
+            from: 'reviews',
+            localField: '_id',
+            foreignField: 'movieId',
+            as: 'reviews'
+            }
+          },
+          { $addFields: { avgRating: { $avg: '$reviews.rating' } } },
+          { $sort: { avgRating: -1 }}
+        ]);
+        return res.json(movies);
         }
-    })
+        const movies = await Movie.find().sort({ title: 1 });
+        return res.json(movies);
+    } catch (err) {
+      return res.status(500).json({ success: false, message: err.message });
+    }
+  })
+  // POST a new movie
+  .post(authJwtController.isAuthenticated, async (req, res) => {
+    try {
+      if (!req.body.title || !req.body.releaseDate || !req.body.genre || !req.body.actors) {
+        return res.status(400).json({ success: false, message: 'Missing required movie information.' });
+      }
+      const newMovie = new Movie(req.body);
+      const savedMovie = await newMovie.save();
+      res.status(201).json({ movie: savedMovie });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
 
-    .get(authJwtController.isAuthenticated, function (req, res) {
-        if(req.query.movieId != null){
-            Movie.find({_id: mongoose.Types.ObjectId(req.query.movieId)}, function(err, data){
-                if(err){
-                    res.status(400).json({message: "Invalid query"});
-                }else if(data.length == 0) {
-                    res.status(400).json({message: "No entry found"});
-                }else{
-                    if(req.query.reviews == "True"){
-                        Movie.aggregate([
-                            {
-                                $match: {'_id': mongoose.Types.ObjectId(req.query.movieId)}
-                            },
-                            {
-                                $lookup:{
-                                    from: 'reviews',
-                                    localField: '_id',
-                                    foreignField: 'Movie_ID',
-                                    as: 'reviews'
-                                }
-                            }],function(err, doc) {
-                            if(err){
-                                console.log("hi");
-                                res.send(err);
-                            }else{
-                                console.log(doc);
-                                res.json(doc);
-                            }
-                        });
-                    }else{
-                        res.json(data);
-                    }
-                }
-            });
-        }else{
-            Movie.find({}, function(err, doc){
-                if(err){
-                    res.json({error: err});
-                }else{
-                    if(req.query.reviews == "True"){
-                        Movie.aggregate([
-                            {
-                                $lookup:{
-                                    from: 'reviews',
-                                    localField: '_id',
-                                    foreignField: 'Movie_ID',
-                                    as: 'reviews'
-                                }
-                            }],function(err, data) {
-                            if(err){
-                                res.send(err);
-                            }else{
-                                res.json(data);
-                            }
-                        });
-                    }else{
-                        res.json(doc);
-                    }
-                }
-            })
+  router.route('/movies/:id')
+  .get(authJwtController.isAuthenticated, async (req, res) => {
+    try {
+      if (req.query.reviews === 'true') {
+        const movieWithReviews = await Movie.aggregate([
+          { $match: { _id: new mongoose.Types.ObjectId(req.params.id) } },
+          { 
+            $lookup: {
+              from: "reviews", 
+              localField: "_id",
+              foreignField: "movieId",
+              as: "reviews"
+            }
+          },
+          { $addFields: {avgRating: {$avg: '$reviews.rating'}}}
+        ]);
+        if (!movieWithReviews.length) {
+          return res.status(404).json({ success: false, message: 'Movie not found.' });
         }
+        res.json(movieWithReviews[0]);
+      } else {
+        // If no reviews query, return just the movie data
+        const movie = await Movie.findById(req.params.id);
+        if (!movie) return res.status(404).json({ success: false, message: 'Movie not found.' });
+        res.json(movie);
+      }
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  })
+  .put(authJwtController.isAuthenticated, async (req, res) => {
+    try {
+      const updatedMovie = await Movie.findByIdAndUpdate(
+        req.params.id,
+        req.body,
+        { new: true, runValidators: true }
+      );
+      if (!updatedMovie) return res.status(404).json({ success: false, message: 'Movie not found.' });
+      res.json(updatedMovie);
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  })
+  .delete(authJwtController.isAuthenticated, async (req, res) => {
+    try {
+      const deletedMovie = await Movie.findByIdAndDelete(req.params.id);
+      if (!deletedMovie) return res.status(404).json({ success: false, message: 'Movie not found.' });
+      res.json({ success: true, message: 'Movie deleted successfully.' });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
 
-    })
+  function getUsername(req) {
+    const hdr   = req.headers.authorization || '';
+    const token = hdr.startsWith('jwt ') ? hdr.slice(4) : hdr;
+    try {
+      const decoded = jwt.verify(token, process.env.SECRET_KEY);
+      return decoded.username;
+    } catch {
+      return null;
+    }
+  }
 
-    .put(authJwtController.isAuthenticated, function(req,res) {
-        if(req.body.title != null && req.body.year_released != null && req.body.genre != null && req.body.actors != null && req.body.actors.length >= 3){
-            Movie.findOneAndUpdate({title:req.body.Search},
-                {
-                    title: req.body.title,
-                    year_released: req.body.year_released,
-                    genre: req.body.genre,
-                    actors: req.body.actors
+  router.post('/reviews', authJwtController.isAuthenticated, async (req, res) => {
+    try {
+      const { movieId, rating, review } = req.body;
+      if (!movieId || rating == null || !review)
+        return res.status(400).json({ message: 'movieId, rating and review are required.' });
+      if (rating < 0 || rating > 5)
+        return res.status(400).json({ message: 'rating must be between 0 and 5.' });
+  
+      const username = getUsername(req);
+      if (!username) return res.status(401).json({ message: 'Invalid token.' });
+  
+      const movie = await Movie.findById(movieId);
+      if (!movie) return res.status(404).json({ message: 'Movie not found.' });
+  
+      await Review.findOneAndUpdate(
+        { movieId, username },
+        { review, rating },
+        { new: true, upsert: true, runValidators: true }
+      );
+  
+      const [{ avgRating = null } = {}] = await Review.aggregate([
+        { $match: { movieId: movie._id } },
+        { $group: { _id: null, avgRating: { $avg: '$rating' } } }
+      ]);
+  
+      const msg = avgRating != null ? 'Review saved!' : 'Review saved, no rating yet.';
+      return res.status(201).json({ message: msg, avgRating });
+    } catch (err) {
+      if (err.code === 11000)
+        return res.status(400).json({ message: 'You already reviewed this movie.' });
+      console.error(err);
+      return res.status(500).json({ message: err.message });
+    }
+  });
+  
+  
+  router.get('/reviews', async (req, res) => {
+    try {
+      const reviews = await Review.find();
+      res.json(reviews);
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
 
-                },function(err, doc){
-                    if(err){
-                        res.json({message: err});
-                    }
-                    else if (doc == null){
-                        res.json({message:"Movie Not Found"})
-                    }else{
-                        res.json({data: doc, message:"Movie Updated"})
-                    }
-                });
-        }else
+
+  // EXTRA CREDIT
+  router.post('/movies/search', async (req, res) => {
+    try {
+      const { query } = req.body;
+      if (!query) return res.status(400).json({ message: 'query is required.' });
+  
+      const regex = new RegExp(query, 'i');
+      const docs  = await Movie.aggregate([
         {
-            res.status(400).json({message: "Please no null values"});
-        }
-    })
+          $match: {
+            $or: [
+              { title: regex },
+              { 'actors.actorName': regex }
+            ]
+          }
+        },
+        {
+          $lookup: {
+            from: 'reviews',
+            localField: '_id',
+            foreignField: 'movieId',
+            as: 'movieReviews'
+          }
+        },
+        { $addFields: { avgRating: { $avg: '$movieReviews.rating' } } },
+        { $sort: { avgRating: -1 } }
+      ]);
+  
+      return res.json(docs);
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ message: err.message });
+    }
+  });
 
-    .delete(authJwtController.isAuthenticated, function(req,res){
-        Movie.findOneAndDelete({title: req.body.title}, function(err, doc){
-            if(err){
-                res.status(400).json({message:err});
-            }
-            else if (doc == null){
-                res.json({message: "Movie not found"});
-            }
-            else{
-                res.json({message: "Movie deleted"});
-            }
-
-        });
-    });
-
-var mongoose = require('mongoose');
-
-router.route('/movies/:movieId')
-    .get(authJwtController.isAuthenticated, function (req, res) {
-        var id = mongoose.Types.ObjectId(req.query.movieId);
-        if (req.query.reviews == "true") {
-            // If reviews query parameter is "true", include movie information and reviews
-            Movie.aggregate([
-                { $match: { '_id': mongoose.Types.ObjectId(req.query.movieId)} },
-                { $lookup: { from: "reviews", localField: "_id", foreignField: "Movie_ID", as: "reviews" } },
-                { $sort: { "reviews.createdAt": -1 } }
-            ], function (err, movie) {
-                if (err) {
-                    return res.status(400).json({ success: false, message: "Error retrieving movie and reviews." });
-                } else {
-                    return res.status(200).json({ success: true, movie: movie[0] });
-                }
-            });
-        } else {
-            // If reviews query parameter is not provided or is not "true", only include movie information
-            Movie.findById(id, function (err, movie) {
-                if (err) {
-                    return res.status(400).json({ success: false, message: "Error retrieving movie." });
-                } else {
-                    return res.status(200).json({ success: true, movie: movie });
-                }
-            });
-        }
-    });
-
-
-router.route('/reviews')
-    .post(authJwtController.isAuthenticated, function(req,res){
-
-        const usertoken = req.headers.authorization;
-        const token = usertoken.split(' ');
-        const decoded = jwt.verify(token[1], process.env.SECRET_KEY);
-
-        Movie.find({_id: req.body.Movie_ID}, function(err, data){
-            if(err){
-                res.status(400).json({message: "Invalid query"});
-            }else if (data != null){
-                let rev = new Review({
-                    username: decoded.username,
-                    review: req.body.review,
-                    rating: req.body.rating,
-                    movie_ID: req.body.movie_ID
-                });
-
-                console.log(req.body);
-
-                rev.save(function(err){
-                    if(err) {
-                        res.json({message: err});
-                    }else{
-                        Review.find({Movie_ID: req.body.Movie_ID}, function (err, allReviews) {
-                            if(err){
-                                res.status(400).json({message: "It's broken!"});
-                            }else{
-                                var avg = 0;
-
-                                allReviews.forEach(function (review) {
-                                    avg += review.rating;
-                                    console.log(review);
-                                });
-                                avg = avg / allReviews.length;
-
-
-                                Movie.update(
-                                    { _id: req.body.Movie_ID},
-                                    { $set: { averageRating: avg} }, function (err, doc){
-                                        if (err){
-                                            res.json({error: err});
-                                        }else if(doc != null){
-                                            res.json({msg: "Review successfully saved"});
-                                        }
-                                    });
-
-                            }
-                        });
-
-                    }
-
-                });
-            }else{
-                res.json({failure: "Movie does not exist"});
-            }
-        });
-    });
 
 app.use('/', router);
-app.listen(process.env.PORT || 8080);
+
+const PORT = process.env.PORT || 8080; // Define PORT before using it
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
+
 module.exports = app; // for testing only
